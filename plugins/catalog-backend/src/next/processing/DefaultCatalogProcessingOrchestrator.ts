@@ -23,6 +23,7 @@ import {
   stringifyEntityRef,
 } from '@backstage/catalog-model';
 import { ConflictError, InputError } from '@backstage/errors';
+import { JsonObject, JsonValue } from '@backstage/config';
 import { ScmIntegrationRegistry } from '@backstage/integration';
 import path from 'path';
 import { Logger } from 'winston';
@@ -31,6 +32,7 @@ import {
   CatalogProcessorParser,
 } from '../../ingestion/processors';
 import * as results from '../../ingestion/processors/results';
+import { CatalogProcessorCache } from '../../ingestion/processors/types';
 import {
   CatalogProcessingOrchestrator,
   EntityProcessingRequest,
@@ -53,6 +55,44 @@ type Context = {
   collector: ProcessorOutputCollector;
 };
 
+class DefaultCatalogProcessorCache implements CatalogProcessorCache {
+  constructor(
+    private readonly initialState: JsonObject,
+    private readonly setFunc: (key: string, value: JsonValue) => Promise<void>,
+  ) {}
+
+  async get<ItemType extends JsonValue>(
+    key: string,
+  ): Promise<ItemType | undefined> {
+    return this.initialState[key] as ItemType | undefined;
+  }
+
+  async set<ItemType extends JsonValue>(
+    key: string,
+    value: ItemType,
+  ): Promise<void> {
+    return this.setFunc(key, value);
+  }
+}
+
+class ProcessorCache {
+  private caches = new Map<string, CatalogProcessorCache>();
+  constructor(private readonly initialState: JsonObject) {}
+
+  forProcessor(name: string): CatalogProcessorCache {
+    const cache = this.caches.get(name);
+    if (cache) {
+      return cache;
+    }
+
+    const newCache = new DefaultCatalogProcessorCache(
+      this.initialState[name] ?? {},
+    );
+    this.caches.set(name, newCache);
+    return newCache;
+  }
+}
+
 export class DefaultCatalogProcessingOrchestrator
   implements CatalogProcessingOrchestrator
 {
@@ -69,16 +109,20 @@ export class DefaultCatalogProcessingOrchestrator
   async process(
     request: EntityProcessingRequest,
   ): Promise<EntityProcessingResult> {
-    return this.processSingleEntity(request.entity);
+    return this.processSingleEntity(request.entity, request.state);
   }
 
   private async processSingleEntity(
     unprocessedEntity: Entity,
+    state: JsonObject = {},
   ): Promise<EntityProcessingResult> {
     const collector = new ProcessorOutputCollector(
       this.options.logger,
       unprocessedEntity,
     );
+
+    // Cache that is scoped to the entity and processor
+    const cache = new ProcessorCache(state);
 
     try {
       // This will be checked and mutated step by step below
@@ -105,6 +149,7 @@ export class DefaultCatalogProcessingOrchestrator
         originLocation: parseLocationReference(
           getEntityOriginLocationRef(entity),
         ),
+        cache,
         collector,
       };
 
